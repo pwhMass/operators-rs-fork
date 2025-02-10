@@ -98,6 +98,11 @@ impl crate::Operator for Operator {
         let &[bsi] = cast(&[bsi], unit_idx as usize).as_slice() else {
             todo!()
         };
+
+        let bsd = bsd as i32;
+        let msd = msd as i32;
+        let kss = kss as i32;
+        let bsi = bsi as i32;
         let params = cuda::params![dst_base, src_base, idx_base, bsd, msd, kss, bsi];
         let block = gcd(self.max_threads_block, n);
         let dimx = n.div_ceil(block);
