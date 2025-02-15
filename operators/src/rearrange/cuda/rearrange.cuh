@@ -279,6 +279,7 @@ static __device__ void rearrange_1_shared(
     const ArrayStruct grid_len,             // 各维度的长度
     const ArrayStruct src_grid_stride,      // 源tensor在各维度上的步长(bytes)
     const ArrayStruct dst_grid_stride,      // 目标tensor在各维度上的步长(bytes)
+    const ArrayStruct smem_stride,          // 共享内存中各维度的步长(bytes)
     unsigned int const unit_size      // 每个元素的字节数
 ) {
     extern __shared__ char smem[];
@@ -308,56 +309,37 @@ static __device__ void rearrange_1_shared(
     int src_offset = shared_src_offset;
     int dst_offset = shared_dst_offset;
     
-    int thread_idx[ARRAY_SIZE] = {0};
     int remaining = threadIdx.x;
-    int smem_stride[ARRAY_SIZE] = {0};
-    int current_stride = 1;
-    int read_smem_idx = 0;
+    int read_smem_offset = 0;
+    int read_src_offset = src_offset;
     
-    // 处理读取阶段
-    for (int pos = ARRAY_SIZE - 1; pos > 0; pos--) {
+    // 合并读取阶段的循环
+    for (int pos = ARRAY_SIZE - 1; pos >= 0; pos--) {
         if (pos >= block_dim) {
             continue;
         }
         
         int idx = src_block_cotinuous_down_idx.a[pos];
         if (block_len.a[idx] != 1) {
-            thread_idx[idx] = remaining % block_len.a[idx];
+            int dim_idx = remaining % block_len.a[idx];
             remaining /= block_len.a[idx];
-            if (thread_idx[idx] >= block_len.a[idx]) {
+            if (dim_idx >= block_len.a[idx]) {
                 return;
             }
-            read_smem_idx += thread_idx[idx] * current_stride;
-            smem_stride[idx] = current_stride;
-            current_stride *= block_len.a[idx];
+            read_smem_offset += dim_idx * smem_stride.a[idx];
+            read_src_offset += dim_idx * src_block_stride.a[idx];
         }
-    }
-    
-    // 处理最后一个维度
-    int idx = src_block_cotinuous_down_idx.a[0];
-    thread_idx[idx] = remaining;
-    if (thread_idx[idx] >= block_len.a[idx]) {
-        return;
-    }
-    read_smem_idx += thread_idx[idx] * current_stride;
-    smem_stride[idx] = current_stride;
-    
-    // 计算源数据偏移
-    int read_src_offset = src_offset;
-    #pragma unroll
-    for (int i = 0; i < ARRAY_SIZE; i++) {
-        if (i >= block_dim) break;
-        read_src_offset += thread_idx[i] * src_block_stride.a[i];
     }
     
     // 读取数据到共享内存
     const int elements_per_thread = unit_size / sizeof(Tmem);
     if (elements_per_thread == 1) {
-        shared[read_smem_idx] = *reinterpret_cast<const Tmem *>(reinterpret_cast<const char*>(src) + read_src_offset);
+        *reinterpret_cast<Tmem *>(reinterpret_cast<char*>(smem) + read_smem_offset) = 
+            *reinterpret_cast<const Tmem *>(reinterpret_cast<const char*>(src) + read_src_offset);
     } else {
         #pragma unroll
         for (int i = 0; i < elements_per_thread; i++) {
-            shared[read_smem_idx * elements_per_thread + i] = 
+            reinterpret_cast<Tmem *>(reinterpret_cast<char*>(smem) + read_smem_offset)[i] = 
                 reinterpret_cast<const Tmem *>(reinterpret_cast<const char*>(src) + read_src_offset)[i];
         }
     }
@@ -366,43 +348,31 @@ static __device__ void rearrange_1_shared(
     
     // 处理写入阶段
     remaining = threadIdx.x;
-    int write_smem_idx = 0;
-    
-    for (int i = ARRAY_SIZE - 1; i > 0; i--) {
-        if (block_len.a[i] == 1) {
-            thread_idx[i] = 0;
-        } else {
-            thread_idx[i] = remaining % block_len.a[i];
-            remaining /= block_len.a[i];
-            if (thread_idx[i] >= block_len.a[i]) {
-                return;
-            }
-            write_smem_idx += thread_idx[i] * smem_stride[i];
-        }
-    }
-    
-    thread_idx[0] = remaining;
-    if (thread_idx[0] >= block_len.a[0]) {
-        return;
-    }
-    write_smem_idx += thread_idx[0] * smem_stride[0];
-    
-    // 计算目标数据偏移
+    int write_smem_offset = 0;
     int write_dst_offset = dst_offset;
-    #pragma unroll
-    for (int i = 0; i < ARRAY_SIZE; i++) {
-        if (i >= block_dim) break;
-        write_dst_offset += thread_idx[i] * dst_block_stride.a[i];
+    
+    for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
+        if (i >= block_dim) continue;
+        if (block_len.a[i] == 1) continue;
+        
+        int dim_idx = remaining % block_len.a[i];
+        remaining /= block_len.a[i];
+        if (dim_idx >= block_len.a[i]) {
+            return;
+        }
+        write_smem_offset += dim_idx * smem_stride.a[i];
+        write_dst_offset += dim_idx * dst_block_stride.a[i];
     }
     
     // 从共享内存写入数据到目标位置
     if (elements_per_thread == 1) {
-        *reinterpret_cast<Tmem *>(reinterpret_cast<char*>(dst) + write_dst_offset) = shared[write_smem_idx];
+        *reinterpret_cast<Tmem *>(reinterpret_cast<char*>(dst) + write_dst_offset) = 
+            *reinterpret_cast<Tmem *>(reinterpret_cast<char*>(smem) + write_smem_offset);
     } else {
         #pragma unroll
         for (int i = 0; i < elements_per_thread; i++) {
             reinterpret_cast<Tmem *>(reinterpret_cast<char*>(dst) + write_dst_offset)[i] = 
-                shared[write_smem_idx * elements_per_thread + i];
+                reinterpret_cast<Tmem *>(reinterpret_cast<char*>(smem) + write_smem_offset)[i];
         }
     }
 }

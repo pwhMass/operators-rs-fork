@@ -16,7 +16,7 @@ struct Layout {
     src_cs: i32,
 }
 
-const ARRAY_SIZE: usize = 7;
+const ARRAY_SIZE: usize = 4;
 
 type ArrayType = i32;
 struct ArrayStruct([ArrayType; ARRAY_SIZE]);
@@ -320,6 +320,23 @@ impl crate::Operator for Operator {
         let src_grid_stride = fill_array!(src_strides, 0, for_grid).unwrap();
         let dst_grid_stride = fill_array!(dst_strides, 0, for_grid).unwrap();
 
+        let smem_stride = shape
+            .iter()
+            .zip(block_dim_choose.iter())
+            .filter_map(
+                |(len, is_choose)| {
+                    if *is_choose {
+                        Some(*len)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .fold((unit, Vec::new()), |(acc, mut vec), len| {
+                vec.push(acc as ArrayType);
+                (acc * len, vec)
+            });
+        let smem_stride = ArrayStruct::new(smem_stride.1.into_iter(), 0).unwrap();
         //----------------------------------------------------------------------
 
         let name = CString::new(NAME).unwrap();
@@ -350,6 +367,7 @@ impl crate::Operator for Operator {
             grid_len,        // 各维度的长度
             src_grid_stride, // 源tensor在各维度上的步长(bytes)
             dst_grid_stride, // 源tensor在各维度上的步长(bytes)
+            smem_stride,     // 共享内存在各维度上的步长(bytes)
             unit             // bytes_per_thread
         ];
 
@@ -381,15 +399,16 @@ extern "C" __global__ void {NAME}(
     const ArrayStruct grid_len,            // 各维度的长度
     const ArrayStruct src_grid_stride,     // 源tensor在各维度上的步长(bytes)
     const ArrayStruct dst_grid_stride,     // 目标tensor在各维度上的步长(bytes)
+    const ArrayStruct smem_stride,         // 共享内存在各维度上的步长(bytes)
     unsigned int const unit_size     // 每个元素的字节数
 ){{
     switch (unit_size) {{
-        case  1: rearrange_1_shared<uchar1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case  2: rearrange_1_shared<uchar2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case  4: rearrange_1_shared<float1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case  8: rearrange_1_shared<float2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case 16: rearrange_1_shared<float4 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case 32: rearrange_1_shared<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case  1: rearrange_1_shared<uchar1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, smem_stride, unit_size); break;
+        case  2: rearrange_1_shared<uchar2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, smem_stride, unit_size); break;
+        case  4: rearrange_1_shared<float1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, smem_stride, unit_size); break;
+        case  8: rearrange_1_shared<float2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, smem_stride, unit_size); break;
+        case 16: rearrange_1_shared<float4 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, smem_stride, unit_size); break;
+        case 32: rearrange_1_shared<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, smem_stride, unit_size); break;
     }}
 }}
 "#
