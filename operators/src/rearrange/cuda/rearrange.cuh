@@ -285,135 +285,222 @@ static __device__ void rearrange_1(
     }
 }
 
+#define DEBUG_BLOCK_X 1
+#define DEBUG_THREAD_X 0
 
 template<class Tmem>
-static __device__ void rearrange_1_blank(
+static __device__ void rearrange_1_shared(
     void *__restrict__ dst,
     void const *__restrict__ src,
-    ArrayStruct block_len,            // 各维度的长度
-    ArrayStruct src_block_stride,     // 源tensor在各维度上的步长(bytes)
-    ArrayStruct dst_block_stride,     // 目标tensor在各维度上的步长(bytes)
-    ArrayStruct grid_len,             // 各维度的长度
-    ArrayStruct src_grid_stride,      // 源tensor在各维度上的步长(bytes)
-    ArrayStruct dst_grid_stride,      // 目标tensor在各维度上的步长(bytes)
+    unsigned int const block_dim,
+    const ArrayStruct block_len,            // 各维度的长度
+    const ArrayStruct src_block_stride,     // 源tensor在各维度上的步长(bytes)
+    const ArrayStruct dst_block_stride,     // 目标tensor在各维度上的步长(bytes)
+    const ArrayStruct src_block_cotinuous_down_idx,  // 源tensor 连续维度索引，0为最不连续的维度，直到ARRAY_SIZE-1为最连续的维度
+    const ArrayStruct grid_len,             // 各维度的长度
+    const ArrayStruct src_grid_stride,      // 源tensor在各维度上的步长(bytes)
+    const ArrayStruct dst_grid_stride,      // 目标tensor在各维度上的步长(bytes)
     unsigned int const unit_size      // 每个元素的字节数
 ) {
+    extern __shared__ char smem[];
+    Tmem* shared = reinterpret_cast<Tmem*>(smem);
     
-    // 打印所有参数
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("size of int: %lu\n", sizeof(int));  // 使用%lu代替%d来匹配unsigned long
-        printf("参数信息:\n");
-        printf("block_len: ");
-        for (int i = 0; i < ARRAY_SIZE; i++) {
-            printf("%d ", block_len.a[i]);
-        }
-        printf("\n");
-
-        printf("src_block_stride: ");
-        for (int i = 0; i < ARRAY_SIZE; i++) {
-            printf("%d ", src_block_stride.a[i]); 
-        }
-        printf("\n");
-
-        printf("dst_block_stride: ");
-        for (int i = 0; i < ARRAY_SIZE; i++) {
-            printf("%d ", dst_block_stride.a[i]);
-        }
-        printf("\n");
-
-        printf("grid_len: ");
-        for (int i = 0; i < ARRAY_SIZE; i++) {
-            printf("%d ", grid_len.a[i]);
-        }
-        printf("\n");
-
-        printf("src_grid_stride: ");
-        for (int i = 0; i < ARRAY_SIZE; i++) {
-            printf("%d ", src_grid_stride.a[i]);
-        }
-        printf("\n");
-
-        printf("dst_grid_stride: ");
-        for (int i = 0; i < ARRAY_SIZE; i++) {
-            printf("%d ", dst_grid_stride.a[i]);
-        }
-        printf("\n");
-
-        printf("unit_size: %d\n", unit_size);
-    }
-}
-
-// 表示维度切分信息
-struct DimSplit {
-    int outer_len;     // 外层循环次数
-    int inner_len;     // 内层每次处理的长度
-    int remainder_len; // 最后一次需要处理的剩余长度(可能小于inner_len)
-    int total_len;     // 原始维度的总长度
-};
-
-struct SplitArrayStruct {
-    DimSplit splits[ARRAY_SIZE];
-};
-
-template<class Tmem>
-static __device__ void rearrange_2(
-    void *__restrict__ dst,
-    void const *__restrict__ src,
-    SplitArrayStruct dim_splits,      // 各维度的切分信息
-    ArrayStruct src_block_stride,     // 源tensor在各维度上的步长
-    ArrayStruct dst_block_stride,     // 目标tensor在各维度上的步长
-    unsigned int const unit_size      // 每个元素的字节数
-){
-    // 计算当前block和thread在各维度上的内外层索引
-    int outer_idx[ARRAY_SIZE];
-    int inner_idx[ARRAY_SIZE];
+    __shared__ int shared_src_offset;
+    __shared__ int shared_dst_offset;
     
-    // 解码blockIdx.x得到外层索引
-    int remaining = blockIdx.x;
-    #pragma unroll
-    for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
-        outer_idx[i] = remaining % dim_splits.splits[i].outer_len;
-        remaining /= dim_splits.splits[i].outer_len;
+    if (threadIdx.x == 0) {  
+        int block_idx[ARRAY_SIZE];
+        int remaining = blockIdx.x;
+        
+        #pragma unroll
+        for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
+            block_idx[i] = remaining % grid_len.a[i];
+            remaining /= grid_len.a[i];
+        }
+        
+        int src_offset = 0;
+        int dst_offset = 0;
+        #pragma unroll
+        for (int i = 0; i < ARRAY_SIZE; i++) {
+            src_offset += block_idx[i] * src_grid_stride.a[i];
+            dst_offset += block_idx[i] * dst_grid_stride.a[i];
+        }
+        
+        shared_src_offset = src_offset;
+        shared_dst_offset = dst_offset;
     }
     
-    // 解码threadIdx.x得到内层索引
-    remaining = threadIdx.x;
-    #pragma unroll
-    for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
-        inner_idx[i] = remaining % dim_splits.splits[i].inner_len;
-        remaining /= dim_splits.splits[i].inner_len;
+    __syncthreads();
+
+    int src_offset = shared_src_offset;
+    int dst_offset = shared_dst_offset;
+    
+    int thread_idx[ARRAY_SIZE] = {0};
+    int remaining = threadIdx.x;
+    int smem_stride[ARRAY_SIZE] = {0};
+    int current_stride = 1;
+    int read_smem_idx = 0;
+    
+    for (int pos = ARRAY_SIZE - 1; pos > 0; pos--) {
+        
+        if (pos >= block_dim) {
+
+        } else {
+            int idx = src_block_cotinuous_down_idx.a[pos];
+
+            thread_idx[idx] = remaining % block_len.a[idx];
+            remaining /= block_len.a[idx];
+            if (thread_idx[idx] >= block_len.a[idx]) {
+                return;
+            }
+            read_smem_idx += thread_idx[idx] * current_stride;
+            smem_stride[idx] = current_stride;
+            current_stride *= block_len.a[idx];
+        }
     }
     
-    // 计算实际访问的偏移
-    int src_offset = 0;
-    int dst_offset = 0;
+    int idx = src_block_cotinuous_down_idx.a[0];
+    thread_idx[idx] = remaining;
+    if (thread_idx[idx] >= block_len.a[idx]) {
+        return;
+    }
+    read_smem_idx += thread_idx[idx] * current_stride;
+    smem_stride[idx] = current_stride;
     
+    int read_src_offset = src_offset;
     #pragma unroll
     for (int i = 0; i < ARRAY_SIZE; i++) {
-        // 计算当前维度的实际索引
-        int actual_idx = outer_idx[i] * dim_splits.splits[i].inner_len + inner_idx[i];
-        
-        // 检查是否是最后一次外层循环，需要处理剩余部分
-        if (outer_idx[i] == dim_splits.splits[i].outer_len - 1 && 
-            actual_idx >= dim_splits.splits[i].total_len) {
-            // 超出范围的线程不执行
-            return;
-        }
-        
-        src_offset += actual_idx * src_block_stride.a[i];
-        dst_offset += actual_idx * dst_block_stride.a[i];
+        if (i >= block_dim) break;
+        read_src_offset += thread_idx[i] * src_block_stride.a[i];
     }
-
-    // 执行数据拷贝
+    
     const int elements_per_thread = unit_size / sizeof(Tmem);
+    
+    // Read data
     if (elements_per_thread == 1) {
-        reinterpret_cast<Tmem *>(dst)[dst_offset] = 
-            reinterpret_cast<Tmem const *>(src)[src_offset];
+        shared[read_smem_idx] = *reinterpret_cast<const Tmem *>(reinterpret_cast<const char*>(src) + read_src_offset);
     } else {
         for (int i = 0; i < elements_per_thread; i++) {
-            reinterpret_cast<Tmem *>(dst)[dst_offset * elements_per_thread + i] = 
-                reinterpret_cast<Tmem const *>(src)[src_offset * elements_per_thread + i];
+            shared[read_smem_idx * elements_per_thread + i] = 
+                reinterpret_cast<const Tmem *>(reinterpret_cast<const char*>(src) + read_src_offset)[i];
+        }
+    }
+    
+    __syncthreads();
+    
+    remaining = threadIdx.x;
+    int write_smem_idx = 0;
+    
+    for (int i = ARRAY_SIZE - 1; i > 0; i--) {
+        if (block_len.a[i] == 1) {
+            thread_idx[i] = 0;
+        } else {
+            thread_idx[i] = remaining % block_len.a[i];
+            remaining /= block_len.a[i];
+            if (thread_idx[i] >= block_len.a[i]) {
+                return;
+            }
+            write_smem_idx += thread_idx[i] * smem_stride[i];
+        }
+    }
+    
+    thread_idx[0] = remaining;
+    if (thread_idx[0] >= block_len.a[0]) {
+        return;
+    }
+    write_smem_idx += thread_idx[0] * smem_stride[0];
+    
+    int write_dst_offset = dst_offset;
+    #pragma unroll
+    for (int i = 0; i < ARRAY_SIZE; i++) {
+        if (i >= block_dim) break;
+        write_dst_offset += thread_idx[i] * dst_block_stride.a[i];
+    }
+    
+    // Write data
+    if (elements_per_thread == 1) {
+        *reinterpret_cast<Tmem *>(reinterpret_cast<char*>(dst) + write_dst_offset) = shared[write_smem_idx];
+    } else {
+        for (int i = 0; i < elements_per_thread; i++) {
+            reinterpret_cast<Tmem *>(reinterpret_cast<char*>(dst) + write_dst_offset)[i] = 
+                shared[write_smem_idx * elements_per_thread + i];
         }
     }
 }
+
+
+
+// 表示维度切分信息
+// struct DimSplit {
+//     int outer_len;     // 外层循环次数
+//     int inner_len;     // 内层每次处理的长度
+//     int remainder_len; // 最后一次需要处理的剩余长度(可能小于inner_len)
+//     int total_len;     // 原始维度的总长度
+// };
+
+// struct SplitArrayStruct {
+//     DimSplit splits[ARRAY_SIZE];
+// };
+
+// template<class Tmem>
+// static __device__ void rearrange_2(
+//     void *__restrict__ dst,
+//     void const *__restrict__ src,
+//     SplitArrayStruct dim_splits,      // 各维度的切分信息
+//     ArrayStruct src_block_stride,     // 源tensor在各维度上的步长
+//     ArrayStruct dst_block_stride,     // 目标tensor在各维度上的步长
+//     unsigned int const unit_size      // 每个元素的字节数
+// ){
+//     // 计算当前block和thread在各维度上的内外层索引
+//     int outer_idx[ARRAY_SIZE];
+//     int inner_idx[ARRAY_SIZE];
+    
+//     // 解码blockIdx.x得到外层索引
+//     int remaining = blockIdx.x;
+//     #pragma unroll
+//     for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
+//         outer_idx[i] = remaining % dim_splits.splits[i].outer_len;
+//         remaining /= dim_splits.splits[i].outer_len;
+//     }
+    
+//     // 解码threadIdx.x得到内层索引
+//     remaining = threadIdx.x;
+//     #pragma unroll
+//     for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
+//         inner_idx[i] = remaining % dim_splits.splits[i].inner_len;
+//         remaining /= dim_splits.splits[i].inner_len;
+//     }
+    
+//     // 计算实际访问的偏移
+//     int src_offset = 0;
+//     int dst_offset = 0;
+    
+//     #pragma unroll
+//     for (int i = 0; i < ARRAY_SIZE; i++) {
+//         // 计算当前维度的实际索引
+//         int actual_idx = outer_idx[i] * dim_splits.splits[i].inner_len + inner_idx[i];
+        
+//         // 检查是否是最后一次外层循环，需要处理剩余部分
+//         if (outer_idx[i] == dim_splits.splits[i].outer_len - 1 && 
+//             actual_idx >= dim_splits.splits[i].total_len) {
+//             // 超出范围的线程不执行
+//             return;
+//         }
+        
+//         src_offset += actual_idx * src_block_stride.a[i];
+//         dst_offset += actual_idx * dst_block_stride.a[i];
+//     }
+
+//     // 执行数据拷贝
+//     const int elements_per_thread = unit_size / sizeof(Tmem);
+//     if (elements_per_thread == 1) {
+//         reinterpret_cast<Tmem *>(dst)[dst_offset] = 
+//             reinterpret_cast<Tmem const *>(src)[src_offset];
+//     } else {
+//         for (int i = 0; i < elements_per_thread; i++) {
+//             reinterpret_cast<Tmem *>(dst)[dst_offset * elements_per_thread + i] = 
+//                 reinterpret_cast<Tmem const *>(src)[src_offset * elements_per_thread + i];
+//         }
+//     }
+// }
 

@@ -280,12 +280,43 @@ impl crate::Operator for Operator {
             };
         }
 
+        let shared_mem_size = unit
+            * shape
+                .iter()
+                .zip(block_dim_choose.iter())
+                .filter_map(
+                    |(len, is_choose)| {
+                        if *is_choose {
+                            Some(*len)
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .product::<usize>();
+        println!("shared_mem_size: {}", shared_mem_size);
+
         let block_dim = block_dim_choose.iter().filter(|&&x| x == true).count() as u32;
         let block_len = fill_array!(shape, 1, for_block).unwrap();
         let src_block_stride = fill_array!(src_strides, 0, for_block).unwrap();
         let dst_block_stride = fill_array!(dst_strides, 0, for_block).unwrap();
-        let grid_len = fill_array!(shape, 1, for_grid).unwrap();
 
+        let src_block_cotinuous_down_idx = src_strides
+            .iter()
+            .zip(block_dim_choose.iter())
+            .filter_map(|(len, is_choose)| {
+                if *is_choose {
+                    Some(*len as ArrayType)
+                } else {
+                    None
+                }
+            })
+            .zip(0..block_dim)
+            .sorted_by(|a, b| b.0.cmp(&a.0))
+            .map(|(_, i)| i as ArrayType);
+        let src_block_cotinuous_down_idx =
+            ArrayStruct::new(src_block_cotinuous_down_idx, ArrayType::MAX).unwrap();
+        let grid_len = fill_array!(shape, 1, for_grid).unwrap();
         let src_grid_stride = fill_array!(src_strides, 0, for_grid).unwrap();
         let dst_grid_stride = fill_array!(dst_strides, 0, for_grid).unwrap();
 
@@ -315,14 +346,21 @@ impl crate::Operator for Operator {
             block_len,        // 各维度的长度
             src_block_stride, // 源tensor在各维度上的步长(bytes)
             dst_block_stride, // 目标tensor在各维度上的步长(bytes)
-            grid_len,         // 各维度的长度
-            src_grid_stride,  // 源tensor在各维度上的步长(bytes)
-            dst_grid_stride,  // 源tensor在各维度上的步长(bytes)
-            unit              // bytes_per_thread
+            src_block_cotinuous_down_idx,
+            grid_len,        // 各维度的长度
+            src_grid_stride, // 源tensor在各维度上的步长(bytes)
+            dst_grid_stride, // 源tensor在各维度上的步长(bytes)
+            unit             // bytes_per_thread
         ];
 
-        self.module
-            .launch(&name, grid, block, params.as_ptr(), 0, queue_alloc.queue());
+        self.module.launch(
+            &name,
+            grid,
+            block,
+            params.as_ptr(),
+            shared_mem_size,
+            queue_alloc.queue(),
+        );
         Ok(())
     }
 }
@@ -339,21 +377,19 @@ extern "C" __global__ void {NAME}(
     const ArrayStruct block_len,           // 各维度的长度
     const ArrayStruct src_block_stride,    // 源tensor在各维度上的步长(bytes)
     const ArrayStruct dst_block_stride,    // 目标tensor在各维度上的步长(bytes)
+    const ArrayStruct src_block_cotinuous_down_idx,  // 源tensor 连续维度索引，0为最不连续的维度，直到ARRAY_SIZE-1为最连续的维度
     const ArrayStruct grid_len,            // 各维度的长度
     const ArrayStruct src_grid_stride,     // 源tensor在各维度上的步长(bytes)
     const ArrayStruct dst_grid_stride,     // 目标tensor在各维度上的步长(bytes)
     unsigned int const unit_size     // 每个元素的字节数
 ){{
     switch (unit_size) {{
-        case  1: rearrange_1<uchar1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case  2: rearrange_1<uchar2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case  4: rearrange_1<float1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case  8: rearrange_1<float2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case 16: rearrange_1<float4 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        case 32: rearrange_1<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        // case 64: rearrange_1<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        // case 128: rearrange_1<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
-        // case 256: rearrange_1<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case  1: rearrange_1_shared<uchar1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case  2: rearrange_1_shared<uchar2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case  4: rearrange_1_shared<float1 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case  8: rearrange_1_shared<float2 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case 16: rearrange_1_shared<float4 >(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
+        case 32: rearrange_1_shared<double4>(dst, src, block_dim, block_len, src_block_stride, dst_block_stride, src_block_cotinuous_down_idx, grid_len, src_grid_stride, dst_grid_stride, unit_size); break;
     }}
 }}
 "#
