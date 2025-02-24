@@ -18,7 +18,7 @@ struct SplitDim {
 }
 
 const ARRAY_SIZE: usize = 5;
-
+const MAX_CONSTRAIN_NUM: usize = 2;
 type ArrayType = i32;
 #[derive(Debug)]
 struct ArrayStruct<const N: usize>([ArrayType; N]);
@@ -286,38 +286,33 @@ impl crate::Operator for Operator {
         let block_len = ArrayStruct::<ARRAY_SIZE>::new(block_len.into_iter(), 1).unwrap();
         let grid_len = ArrayStruct::<ARRAY_SIZE>::new(grid_len.into_iter(), 1).unwrap();
 
-        let (constrain1, constrain2) = match split_dims.len() {
-            0 => (ArrayStruct([0; 4]), ArrayStruct([0; 4])),
-            1 => {
-                let constrains1 = ArrayStruct([
-                    split_dims[0].array_struct_idx_grid,
-                    split_dims[0].array_struct_idx_block,
-                    split_dims[0].num_per_block as ArrayType,
-                    shape[split_dims[0].choose_idx] as ArrayType,
-                ]);
-                let constrains2 = ArrayStruct([0; 4]);
-                (constrains1, constrains2)
-            }
-            2 => {
-                let constrains1 = ArrayStruct([
-                    split_dims[0].array_struct_idx_grid,
-                    split_dims[0].array_struct_idx_block,
-                    split_dims[0].num_per_block as ArrayType,
-                    shape[split_dims[0].choose_idx] as ArrayType,
-                ]);
-                let constrains2 = ArrayStruct([
-                    split_dims[1].array_struct_idx_grid,
-                    split_dims[1].array_struct_idx_block,
-                    split_dims[1].num_per_block as ArrayType,
-                    shape[split_dims[1].choose_idx] as ArrayType,
-                ]);
-                (constrains1, constrains2)
-            }
+        let constrain_num = split_dims.len() as u32;
+        let constrains = match split_dims.len() {
+            0 => ArrayStruct([0; 8]),
+            1 => ArrayStruct([
+                split_dims[0].array_struct_idx_grid,
+                split_dims[0].array_struct_idx_block,
+                split_dims[0].num_per_block as ArrayType,
+                shape[split_dims[0].choose_idx] as ArrayType,
+                0,
+                0,
+                0,
+                0,
+            ]),
+            2 => ArrayStruct([
+                split_dims[0].array_struct_idx_grid,
+                split_dims[0].array_struct_idx_block,
+                split_dims[0].num_per_block as ArrayType,
+                shape[split_dims[0].choose_idx] as ArrayType,
+                split_dims[1].array_struct_idx_grid,
+                split_dims[1].array_struct_idx_block,
+                split_dims[1].num_per_block as ArrayType,
+                shape[split_dims[1].choose_idx] as ArrayType,
+            ]),
             _ => {
                 unreachable!()
             }
         };
-        //----------------------------------------------------------------------
 
         let name = CString::new(NAME).unwrap();
 
@@ -341,15 +336,15 @@ impl crate::Operator for Operator {
             args.src_base,
             block_dim,
             block_len_total,
-            constrain1,
-            constrain2,
-            block_len,        // 各维度的长度
-            src_block_stride, // 源tensor在各维度上的步长(bytes)
-            dst_block_stride, // 目标tensor在各维度上的步长(bytes)
-            grid_len,         // 各维度的长度
-            src_grid_stride,  // 源tensor在各维度上的步长(bytes)
-            dst_grid_stride,  // 源tensor在各维度上的步长(bytes)
-            unit              // bytes_per_thread
+            constrain_num, // 添加约束条件数量
+            constrains,    // 传递约束条件数组
+            block_len,
+            src_block_stride,
+            dst_block_stride,
+            grid_len,
+            src_grid_stride,
+            dst_grid_stride,
+            unit
         ];
 
         self.module
@@ -362,48 +357,73 @@ fn format_code() -> String {
     format!(
         r#"#define ARRAY_SIZE {ARRAY_SIZE}
 #define ARRAY_TYPE int
+#define MAX_CONSTRAIN_NUM {MAX_CONSTRAIN_NUM}
 {CODE}
 
 extern "C" __global__ void {NAME}(
     void       *__restrict__ dst,
     void const *__restrict__ src,
-    unsigned int const block_dim,                                   // block维度数量
-    unsigned int const block_len_total,                            // block_len 各元素的乘积
-    const ArrayStruct<4, ARRAY_TYPE> constrains1,         // 切分维度的约束条件1
-    const ArrayStruct<4, ARRAY_TYPE> constrains2,         // 切分维度的约束条件2
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> block_len,          // 各维度的长度
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_block_stride,   // 源tensor在各维度上的步长(bytes)
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_block_stride,   // 目标tensor在各维度上的步长(bytes)
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> grid_len,           // 各维度的长度
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_grid_stride,    // 源tensor在各维度上的步长(bytes)
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_grid_stride,    // 目标tensor在各维度上的步长(bytes)
-    unsigned int const unit_size                                  // 每个元素的字节数
+    unsigned int const block_dim,                                   
+    unsigned int const block_len_total,                            
+    unsigned int const constrain_num,                                       // 约束条件数量
+    const ArrayStruct<4, ARRAY_TYPE> constrains[MAX_CONSTRAIN_NUM],                 // 约束条件数组
+    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> block_len,          
+    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_block_stride,   
+    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_block_stride,   
+    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> grid_len,           
+    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_grid_stride,    
+    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_grid_stride,    
+    unsigned int const unit_size                                  
 ){{
-    switch (unit_size) {{
-        case  1: 
-            rearrange_1<uchar1 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains1, constrains2, 
-                block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); 
-            break;
-        case  2: 
-            rearrange_1<uchar2 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains1, constrains2, 
-                block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); 
-            break;
-        case  4: 
-            rearrange_1<float1 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains1, constrains2, 
-                block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); 
-            break;
-        case  8: 
-            rearrange_1<float2 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains1, constrains2, 
-                block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); 
-            break;
-        case 16: 
-            rearrange_1<float4 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains1, constrains2, 
-                block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); 
-            break;
-        case 32: 
-            rearrange_1<double4,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains1, constrains2, 
-                block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); 
-            break;
+    switch (constrain_num) {{
+    case 0:
+        switch (unit_size) {{
+            case  1: rearrange_1<uchar1 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains, 
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  2: rearrange_1<uchar2 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  4: rearrange_1<float1 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  8: rearrange_1<float2 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case 16: rearrange_1<float4 ,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case 32: rearrange_1<double4,ARRAY_SIZE, ARRAY_TYPE>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+        }}
+        break;
+    case 1:
+        switch (unit_size) {{
+            case  1: rearrange_1<uchar1 ,ARRAY_SIZE, ARRAY_TYPE, 1>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  2: rearrange_1<uchar2 ,ARRAY_SIZE, ARRAY_TYPE, 1>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  4: rearrange_1<float1 ,ARRAY_SIZE, ARRAY_TYPE, 1>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  8: rearrange_1<float2 ,ARRAY_SIZE, ARRAY_TYPE, 1>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case 16: rearrange_1<float4 ,ARRAY_SIZE, ARRAY_TYPE, 1>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case 32: rearrange_1<double4,ARRAY_SIZE, ARRAY_TYPE, 1>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+        }}
+        break;
+    case 2:
+        switch (unit_size) {{
+            case  1: rearrange_1<uchar1 ,ARRAY_SIZE, ARRAY_TYPE, 2>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  2: rearrange_1<uchar2 ,ARRAY_SIZE, ARRAY_TYPE, 2>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  4: rearrange_1<float1 ,ARRAY_SIZE, ARRAY_TYPE, 2>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case  8: rearrange_1<float2 ,ARRAY_SIZE, ARRAY_TYPE, 2>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case 16: rearrange_1<float4 ,ARRAY_SIZE, ARRAY_TYPE, 2>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+            case 32: rearrange_1<double4,ARRAY_SIZE, ARRAY_TYPE, 2>(dst, src, block_dim, block_len_total, constrains,
+                     block_len, src_block_stride, dst_block_stride, grid_len, src_grid_stride, dst_grid_stride); break;
+        }}
+        break;
     }}
 }}
 "#
