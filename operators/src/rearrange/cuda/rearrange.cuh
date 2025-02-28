@@ -1,6 +1,10 @@
 
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE 5
+#ifndef BLOCK_ARRAY_SIZE
+#define BLOCK_ARRAY_SIZE 5
+#endif
+
+#ifndef GRID_ARRAY_SIZE
+#define GRID_ARRAY_SIZE 5
 #endif
 
 #ifndef ARRAY_TYPE
@@ -27,13 +31,13 @@ __forceinline__ __device__ void rearrange_kernel(
     void *__restrict__ dst,
     void const *__restrict__ src,
     unsigned int const block_dim,
-    unsigned int const block_len_total,                        // block_len 各元素的乘积
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> block_len,       // 各维度的长度
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_block_stride,// 源tensor在各维度上的步长(bytes)
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_block_stride,// 目标tensor在各维度上的步长(bytes)
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> grid_len,        // 各维度的长度
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_grid_stride, // 源tensor在各维度上的步长(bytes)
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_grid_stride  // 目标tensor在各维度上的步长(bytes)
+    unsigned int const block_len_total,                              // block_len 各元素的乘积
+    const ArrayStruct<BLOCK_ARRAY_SIZE, ARRAY_TYPE> block_len,       // 各维度的长度
+    const ArrayStruct<BLOCK_ARRAY_SIZE, ARRAY_TYPE> src_block_stride,// 源tensor在各维度上的步长(bytes)
+    const ArrayStruct<BLOCK_ARRAY_SIZE, ARRAY_TYPE> dst_block_stride,// 目标tensor在各维度上的步长(bytes)
+    const ArrayStruct<GRID_ARRAY_SIZE, ARRAY_TYPE> grid_len,         // 各维度的长度
+    const ArrayStruct<GRID_ARRAY_SIZE, ARRAY_TYPE> src_grid_stride,  // 源tensor在各维度上的步长(bytes)
+    const ArrayStruct<GRID_ARRAY_SIZE, ARRAY_TYPE> dst_grid_stride   // 目标tensor在各维度上的步长(bytes)
 #if CONSTRAIN_NUM > 0
     ,
     const ArrayStruct<CONSTRAIN_NUM, Constrains<ARRAY_TYPE>> constrains// 切分维度的约束条件数组
@@ -60,7 +64,7 @@ __forceinline__ __device__ void rearrange_kernel(
 #endif
         int remaining = blockIdx.x;
 
-        for (int i = ARRAY_SIZE - 1; i >= 0; i--) {
+        for (int i = GRID_ARRAY_SIZE - 1; i >= 0; i--) {
             int idx = remaining % grid_len.a[i];
             remaining /= grid_len.a[i];
             src_offset += idx * src_grid_stride.a[i];
@@ -97,30 +101,29 @@ __forceinline__ __device__ void rearrange_kernel(
     }
 #endif
 
-    for (int i = ARRAY_SIZE - 1; i > 0; i--) {
-        if (block_len.a[i] > 1) {
-            int idx = remaining % block_len.a[i];
-            remaining /= block_len.a[i];
-            // 计算偏移量
-            src_offset += idx * src_block_stride.a[i];
-            dst_offset += idx * dst_block_stride.a[i];
+    for (int i = BLOCK_ARRAY_SIZE - 1; i > 0; i--) {
+
+        int idx = remaining % block_len.a[i];
+        remaining /= block_len.a[i];
+        // 计算偏移量
+        src_offset += idx * src_block_stride.a[i];
+        dst_offset += idx * dst_block_stride.a[i];
 #if CONSTRAIN_NUM > 0
-            for (int j = 0; j < CONSTRAIN_NUM; j++) {
-                if (constrains.a[j].total_len != 0 && i == constrains.a[j].block_idx) {
-                    if (constrains_grid_idx_multiple[j] + idx >= constrains.a[j].total_len) {
-                        return;
-                    }
+        for (int j = 0; j < CONSTRAIN_NUM; j++) {
+            if (i == constrains.a[j].block_idx) {
+                if (constrains_grid_idx_multiple[j] + idx >= constrains.a[j].total_len) {
+                    return;
                 }
             }
-#endif
         }
+#endif
     }
 
     src_offset += remaining * src_block_stride.a[0];
     dst_offset += remaining * dst_block_stride.a[0];
 #if CONSTRAIN_NUM > 0
     for (int j = 0; j < CONSTRAIN_NUM; j++) {
-        if (constrains.a[j].total_len != 0 && 0 == constrains.a[j].block_idx) {
+        if (0 == constrains.a[j].block_idx) {
             if (constrains_grid_idx_multiple[j] + remaining >= constrains.a[j].total_len) {
                 return;
             }

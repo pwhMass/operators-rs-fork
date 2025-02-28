@@ -6,7 +6,9 @@ use crate::{
 };
 use itertools::Itertools;
 use lru::LruCache;
+use std::cmp::max;
 use std::iter::repeat;
+use std::slice::{from_raw_parts, from_raw_parts_mut};
 use std::{
     ffi::CString,
     sync::{Arc, Mutex},
@@ -15,6 +17,8 @@ use std::{
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct SchemeKey {
     unit_size: usize,
+    block_array_size: usize,
+    grid_array_size: usize,
     constrain_num: usize,
 }
 
@@ -26,19 +30,14 @@ struct Scheme {
 
 impl Scheme {
     pub fn new(key: SchemeKey, handle: &Arc<Handle>) -> Result<Self, SchemeError> {
-        let name = kernel_name(key.unit_size, key.constrain_num);
+        let name = kernel_name(key);
         let cc = handle.device().compute_capability();
         // for DEBUG
         // let code = format_code(key.unit_size, key.constrain_num);
         // std::fs::write("rearrange.cu", code).unwrap();
 
-        /// Maximum number of dimensions supported in the array
-        const ARRAY_SIZE: usize = 5;
-
         Ok(Self {
-            module: handle.compile_kernel(&name, cc, || {
-                format_code(key.unit_size, ARRAY_SIZE, key.constrain_num)
-            }),
+            module: handle.compile_kernel(&name, cc, || format_code(key)),
             name: CString::new(name).unwrap(),
         })
     }
@@ -46,6 +45,9 @@ impl Scheme {
 
 /// Type used for array indices and strides
 type ArrayType = i32;
+
+// 默认的数组大小，不能为0
+const DEFAULT_ARRAY_SIZE: usize = 5;
 
 #[derive(Debug)]
 struct SplitDim {
@@ -62,7 +64,7 @@ struct ArrayStruct(Vec<ArrayType>);
 
 impl ArrayStruct {
     fn new(mut array: Vec<ArrayType>, default: ArrayType) -> Result<Self, SchemeError> {
-        while array.len() < 5 {
+        while array.len() < DEFAULT_ARRAY_SIZE {
             array.push(default);
         }
         Ok(Self(array))
@@ -151,6 +153,13 @@ impl crate::Operator for Operator {
 
         // 发现最大的1 thread 处理的数据量
         let scheme_update = scheme_update.distribute_unit((0..=5).rev().map(|n| (1 << n)));
+        if scheme_update.ndim() == 0 {
+            let unit = scheme_update.unit();
+            let dst = unsafe { from_raw_parts_mut(args.dst_base, unit) };
+            let src = unsafe { from_raw_parts(args.src_base, unit) };
+            queue_alloc.queue().memcpy_d2d(dst, src);
+            return Ok(());
+        }
 
         let src_strides = scheme_update.src_strides();
         let dst_strides = scheme_update.dst_strides();
@@ -172,6 +181,7 @@ impl crate::Operator for Operator {
         let max_block_size = 256;
         let mut split_dims = Vec::new(); // 长度最多为2
 
+        //进行维度选择
         {
             let mut src_choose_idx = ndim;
             let mut dst_choose_idx = ndim;
@@ -275,13 +285,13 @@ impl crate::Operator for Operator {
 
         let mut block_dim: ArrayType = 0;
 
-        let mut block_len = Vec::<ArrayType>::with_capacity(5);
-        let mut src_block_stride = Vec::<ArrayType>::with_capacity(5);
-        let mut dst_block_stride = Vec::<ArrayType>::with_capacity(5);
+        let mut block_len = Vec::<ArrayType>::with_capacity(DEFAULT_ARRAY_SIZE);
+        let mut src_block_stride = Vec::<ArrayType>::with_capacity(DEFAULT_ARRAY_SIZE);
+        let mut dst_block_stride = Vec::<ArrayType>::with_capacity(DEFAULT_ARRAY_SIZE);
 
-        let mut grid_len = Vec::<ArrayType>::with_capacity(5);
-        let mut src_grid_stride = Vec::<ArrayType>::with_capacity(5);
-        let mut dst_grid_stride = Vec::<ArrayType>::with_capacity(5);
+        let mut grid_len = Vec::<ArrayType>::with_capacity(DEFAULT_ARRAY_SIZE);
+        let mut src_grid_stride = Vec::<ArrayType>::with_capacity(DEFAULT_ARRAY_SIZE);
+        let mut dst_grid_stride = Vec::<ArrayType>::with_capacity(DEFAULT_ARRAY_SIZE);
 
         // 处理block，填充block_len，block_stride
         for i in 0..ndim {
@@ -328,11 +338,19 @@ impl crate::Operator for Operator {
             }
         }
 
-        let constrain_num = split_dims.len();
+        let filter_split_dims = split_dims
+            .iter()
+            .filter(|split_dim| split_dim.dim_len % split_dim.num_per_block != 0)
+            .collect::<Vec<_>>();
 
+        let constrain_num = filter_split_dims.len();
+
+        // 准备kernel
         let key = SchemeKey {
             unit_size: unit,
             constrain_num,
+            block_array_size: block_len.len(),
+            grid_array_size: grid_len.len(),
         };
 
         let mut schemes = self.schemes.lock().unwrap();
@@ -350,11 +368,6 @@ impl crate::Operator for Operator {
         let dst_grid_stride = ArrayStruct::new(dst_grid_stride, 0)?;
         let block_len = ArrayStruct::new(block_len, 1)?;
         let grid_len = ArrayStruct::new(grid_len, 1)?;
-
-        let filter_split_dims = split_dims
-            .iter()
-            .filter(|split_dim| split_dim.dim_len % split_dim.num_per_block != 0)
-            .collect::<Vec<_>>();
 
         let constrains = match filter_split_dims.len() {
             0 => ArrayStruct(vec![0; 8]),
@@ -407,7 +420,14 @@ impl crate::Operator for Operator {
     }
 }
 
-fn kernel_name(unit_size: usize, constrain_num: usize) -> String {
+fn kernel_name(
+    SchemeKey {
+        unit_size,
+        block_array_size,
+        grid_array_size,
+        constrain_num,
+    }: SchemeKey,
+) -> String {
     let tmem_type = match unit_size {
         1 => "uchar1",
         2 => "uchar2",
@@ -417,13 +437,32 @@ fn kernel_name(unit_size: usize, constrain_num: usize) -> String {
         32 => "double4",
         _ => unreachable!(),
     };
-    format!("rearrange_unit_{tmem_type}_constrain_{constrain_num}")
+    format!(
+        "rearrange_unit_{tmem_type}_block_{block_array_size}_grid_{grid_array_size}_constrain_{constrain_num}"
+    )
 }
 
-fn format_code(unit_size: usize, array_size: usize, constrain_num: usize) -> String {
+fn format_code(
+    SchemeKey {
+        unit_size,
+        block_array_size,
+        grid_array_size,
+        constrain_num,
+    }: SchemeKey,
+) -> String {
+    assert!(block_array_size != 0);
+
+    let kernel_name = kernel_name(SchemeKey {
+        unit_size,
+        block_array_size,
+        grid_array_size,
+        constrain_num,
+    });
+    //处理 grid_array_size = 0的情况
+    let grid_array_size = max(grid_array_size, 1);
+
     let mut code = String::new();
 
-    let kernel_name = kernel_name(unit_size, constrain_num);
     let tmem_type = match unit_size {
         1 => "uchar1",
         2 => "uchar2",
@@ -435,7 +474,8 @@ fn format_code(unit_size: usize, array_size: usize, constrain_num: usize) -> Str
     };
 
     // 添加头部定义
-    code.push_str(&format!("#define ARRAY_SIZE {array_size}\n"));
+    code.push_str(&format!("#define BLOCK_ARRAY_SIZE {block_array_size}\n"));
+    code.push_str(&format!("#define GRID_ARRAY_SIZE {grid_array_size}\n"));
     code.push_str("#define ARRAY_TYPE int\n");
     code.push_str(&format!("#define CONSTRAIN_NUM {constrain_num}\n"));
     code.push_str(CODE);
@@ -449,12 +489,12 @@ extern "C" __global__ void {kernel_name}(
     void const *__restrict__ src,
     unsigned int const block_dim,
     unsigned int const block_len_total,
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> block_len,
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_block_stride,
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_block_stride,
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> grid_len,
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> src_grid_stride,
-    const ArrayStruct<ARRAY_SIZE, ARRAY_TYPE> dst_grid_stride
+    const ArrayStruct<BLOCK_ARRAY_SIZE, ARRAY_TYPE> block_len,
+    const ArrayStruct<BLOCK_ARRAY_SIZE, ARRAY_TYPE> src_block_stride,
+    const ArrayStruct<BLOCK_ARRAY_SIZE, ARRAY_TYPE> dst_block_stride,
+    const ArrayStruct<GRID_ARRAY_SIZE, ARRAY_TYPE> grid_len,
+    const ArrayStruct<GRID_ARRAY_SIZE, ARRAY_TYPE> src_grid_stride,
+    const ArrayStruct<GRID_ARRAY_SIZE, ARRAY_TYPE> dst_grid_stride
 #if CONSTRAIN_NUM > 0
     ,const ArrayStruct<CONSTRAIN_NUM, Constrains<ARRAY_TYPE>> constrains
 #endif
@@ -477,9 +517,12 @@ extern "C" __global__ void {kernel_name}(
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use super::{Args, Gpu, Operator};
     use crate::{ConstPtr, Hardware, MutPtr, Operator as _, TensorLayout};
     use digit_layout::{types as ty, DigitLayout};
+    use log::debug;
 
     fn dyn_args<H: Hardware>(dt: DigitLayout) -> Args<H> {
         use crate::dyn_;
@@ -530,6 +573,8 @@ mod test {
                 let key = SchemeKey {
                     unit_size,
                     constrain_num,
+                    block_array_size: 5,
+                    grid_array_size: 5,
                 };
                 op.schemes
                     .lock()
@@ -556,8 +601,8 @@ mod test {
         });
     }
 
-    #[test]
-    fn test_compute() {
+    fn copute_with_check<const N: usize, const TRANS_N: usize>(shape: [usize; N]) -> Duration {
+        assert!(TRANS_N <= N, "TRANS_N must be less than or equal to N");
         use super::super::common_cpu::Operator as RefOp;
         use crate::common_cpu::{Cpu, ThisThread};
 
@@ -566,7 +611,7 @@ mod test {
         use rand::Rng;
 
         let Some(gpu) = Gpu::init() else {
-            return;
+            panic!("init gpu failed");
         };
 
         let dt = ty::U64;
@@ -576,9 +621,6 @@ mod test {
         cpu_op.scheme(&dyn_args(dt), 0).unwrap();
         gpu_op.scheme(&dyn_args(dt), 0).unwrap();
 
-        const N: usize = 3;
-        const TRANS_N: usize = 3;
-        let shape: [usize; N] = [32, 2, 17];
         let mut r_shape: [usize; N] = shape.clone();
         r_shape[0..TRANS_N].reverse();
 
@@ -589,16 +631,16 @@ mod test {
         rand::rng().fill(&mut src[..]);
 
         let ele = dt.nbytes();
-        let s_src = ArrayLayout::<3>::new_contiguous(&shape, BigEndian, ele);
+        let s_src = ArrayLayout::<N>::new_contiguous(&shape, BigEndian, ele);
         let s_dst =
-            ArrayLayout::<3>::new_contiguous(&r_shape, BigEndian, ele).transpose(&trans_param);
+            ArrayLayout::<N>::new_contiguous(&r_shape, BigEndian, ele).transpose(&trans_param);
 
-        println!("s_src shape: {:?}", s_src.shape());
-        println!("s_dst shape: {:?}", s_dst.shape());
-        println!("s_src strides: {:?}", s_src.strides());
-        println!("s_dst strides: {:?}", s_dst.strides());
+        debug!("s_src shape: {:?}", s_src.shape());
+        debug!("s_dst shape: {:?}", s_dst.shape());
+        debug!("s_src strides: {:?}", s_src.strides());
+        debug!("s_dst strides: {:?}", s_dst.strides());
 
-        let dst_ans = gpu.apply(|ctx| {
+        let (dst_ans, time) = gpu.apply(|ctx| {
             let stream = ctx.stream();
             #[cfg(use_nvidia)]
             let rt = &stream;
@@ -647,11 +689,10 @@ mod test {
             let end_event = stream.record();
             end_event.synchronize();
             let time = end_event.elapse_from(&start_event);
-            println!("time: {time:?}");
 
             let mut host = vec![0u64; shape.iter().product::<usize>()];
             memcpy_d2h(&mut host, &dst);
-            host
+            (host, time)
         });
 
         let mut dst_ref = vec![0u64; shape.iter().product::<usize>()];
@@ -670,5 +711,29 @@ mod test {
             )
             .unwrap();
         assert_eq!(dst_ans, dst_ref);
+        time
+    }
+
+    #[test]
+    fn test_compute() {
+        let shape = [2];
+        let time = copute_with_check::<1, 1>(shape);
+        println!("time: {time:?}");
+
+        let shape = [13];
+        let time = copute_with_check::<1, 1>(shape);
+        println!("time: {time:?}");
+
+        let shape = [16, 2, 16];
+        let time = copute_with_check::<3, 3>(shape);
+        println!("time: {time:?}");
+
+        let shape = [32, 2, 17];
+        let time = copute_with_check::<3, 3>(shape);
+        println!("time: {time:?}");
+
+        let shape = [32, 2, 17, 2, 13];
+        let time = copute_with_check::<5, 3>(shape);
+        println!("time: {time:?}");
     }
 }
